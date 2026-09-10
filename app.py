@@ -61,7 +61,7 @@ FIELD_PATTERNS = {
     "District":  r"District\b\s*[:\-]?\s*(.+)",
 }
 
-STEPS = ["Upload", "Processing", "Verify", "Record Log"]
+STEPS = ["Upload", "Scan", "Extract", "Verify", "Record Log"]
 
 LANGUAGE_OPTIONS = {
     "English": "eng"
@@ -150,7 +150,10 @@ defaults = {
     "image": None,
     "source_label": None,
     "ocr_lang_name": "English",
-    "processed": False,      # whether OCR + extraction has run for the current image
+    "scanned": False,        # whether preprocessing has run for the current image
+    "preprocessed_image": None,
+    "extracted": False,      # whether OCR + extraction has run for the current image
+    "ocr_text": None,
     "fields": None,
     "errors": None,
     "confidence": None,
@@ -182,9 +185,10 @@ with st.sidebar:
     st.markdown(
         """
         1. **Upload** land record
-        2. **Processing** (AI reads & extracts fields)
-        3. **Confidence & Human Verification**
-        4. **Record Log**
+        2. **Scan** (preprocess the image)
+        3. **Extract** (OCR + field extraction)
+        4. **Verify** (confidence & human check)
+        5. **Record Log**
         """
     )
     st.markdown("---")
@@ -234,54 +238,54 @@ if current == 0:
     if uploaded_file is not None:
         st.session_state.image = Image.open(uploaded_file)
         st.session_state.source_label = uploaded_file.name
-        st.session_state.processed = False
+        st.session_state.scanned = False
+        st.session_state.extracted = False
     elif use_good:
         st.session_state.image = Image.open(os.path.join(SAMPLE_DIR, "document_good.png"))
         st.session_state.source_label = "document_good.png (demo sample — clean scan)"
-        st.session_state.processed = False
+        st.session_state.scanned = False
+        st.session_state.extracted = False
     elif use_bad:
         st.session_state.image = Image.open(os.path.join(SAMPLE_DIR, "document_bad.png"))
         st.session_state.source_label = "document_bad.png (demo sample — poor/incomplete scan)"
-        st.session_state.processed = False
+        st.session_state.scanned = False
+        st.session_state.extracted = False
 
     if st.session_state.image is not None:
         st.success(f"Document loaded: **{st.session_state.source_label}**")
         st.image(st.session_state.image, caption="Preview", width=450)
-        if st.button("Next → Process Document", type="primary"):
+        if st.button("Next → Scan Document", type="primary"):
             go_to(1)
             st.rerun()
     else:
         st.info("Upload a document or click a demo sample button above to continue.")
 
 # ========================================================================================
-# STEP 1 — PROCESSING (OCR + extraction happen silently, nothing technical shown)
+# STEP 1 — SCAN (preprocessing only: grayscale, blur, Otsu threshold)
 # ========================================================================================
 elif current == 1:
-    st.markdown("### Step 2 — Processing Your Document")
-    st.write("The system is reading the document and identifying land-record details. This only takes a moment.")
+    st.markdown("### Step 2 — Scan: Original vs. Preprocessed")
+    st.write(
+        "Before reading the text, the system cleans up the image — converting to grayscale "
+        "and applying thresholding so faint or uneven scans are easier to read."
+    )
 
-    st.image(st.session_state.image, caption=st.session_state.source_label, width=450)
+    if not st.session_state.scanned:
+        with st.spinner("Preprocessing image..."):
+            img = np.array(st.session_state.image.convert("RGB"))
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            st.session_state.preprocessed_image = Image.fromarray(thresh)
+            st.session_state.scanned = True
 
-    if not st.session_state.processed:
-        progress = st.progress(0, text="Scanning document...")
-        time.sleep(0.4)
-        progress.progress(35, text="Reading text...")
-
-        lang_code = LANGUAGE_OPTIONS[st.session_state.ocr_lang_name]
-        ocr_text, _ = preprocess_and_ocr(st.session_state.image, lang=lang_code)
-
-        progress.progress(70, text="Identifying land-record fields...")
-        fields = extract_fields(ocr_text)
-        time.sleep(0.3)
-        progress.progress(100, text="Done.")
-
-        # OCR text and raw extraction JSON are intentionally NOT displayed —
-        # only the structured result moves forward to the Verify step.
-        st.session_state.fields = fields
-        st.session_state.processed = True
-        st.rerun()
-    else:
-        st.success("✅ Document processed successfully.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Original**")
+        st.image(st.session_state.image, caption=st.session_state.source_label, width=380)
+    with c2:
+        st.markdown("**Preprocessed (grayscale + threshold)**")
+        st.image(st.session_state.preprocessed_image, caption="Ready for OCR", width=380)
 
     b1, b2 = st.columns(2)
     with b1:
@@ -289,16 +293,61 @@ elif current == 1:
             go_to(0)
             st.rerun()
     with b2:
-        if st.session_state.processed:
+        if st.button("Next → Extract Fields", type="primary"):
+            go_to(2)
+            st.rerun()
+
+# ========================================================================================
+# STEP 2 — EXTRACT (OCR raw text, then extracted fields as JSON)
+# ========================================================================================
+elif current == 2:
+    st.markdown("### Step 3 — Extract: OCR Text & Field Extraction")
+    st.write("The system reads the preprocessed image with OCR, then pulls out the structured fields.")
+
+    if not st.session_state.extracted:
+        progress = st.progress(0, text="Reading text...")
+        lang_code = LANGUAGE_OPTIONS[st.session_state.ocr_lang_name]
+        try:
+            ocr_text = pytesseract.image_to_string(
+                np.array(st.session_state.preprocessed_image), lang=lang_code
+            )
+        except pytesseract.TesseractError:
+            ocr_text = pytesseract.image_to_string(
+                np.array(st.session_state.preprocessed_image), lang="eng"
+            )
+        progress.progress(60, text="Identifying land-record fields...")
+        fields = extract_fields(ocr_text)
+        time.sleep(0.3)
+        progress.progress(100, text="Done.")
+
+        st.session_state.ocr_text = ocr_text
+        st.session_state.fields = fields
+        st.session_state.extracted = True
+        st.rerun()
+    else:
+        st.markdown("#### 📝 Raw OCR Text")
+        st.text_area("OCR output", value=st.session_state.ocr_text or "(no text detected)",
+                      height=180, disabled=True, label_visibility="collapsed")
+
+        st.markdown("#### 🗃️ Extracted Fields (JSON)")
+        st.json(st.session_state.fields)
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("← Back"):
+            go_to(1)
+            st.rerun()
+    with b2:
+        if st.session_state.extracted:
             if st.button("Next → Confidence & Verification", type="primary"):
-                go_to(2)
+                go_to(3)
                 st.rerun()
 
 # ========================================================================================
-# STEP 2 — CONFIDENCE + HUMAN VERIFICATION
+# STEP 3 — CONFIDENCE + HUMAN VERIFICATION
 # ========================================================================================
-elif current == 2:
-    st.markdown("### Step 3 — Confidence Score & Human Verification")
+elif current == 3:
+    st.markdown("### Step 4 — Confidence Score & Human Verification")
 
     fields = st.session_state.fields
     errors = validate_record(fields)
@@ -336,7 +385,7 @@ elif current == 2:
     b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("← Back"):
-            go_to(1)
+            go_to(2)
             st.rerun()
     with b2:
         if st.button("✅ Approve & Digitize", type="primary", use_container_width=True):
@@ -344,21 +393,21 @@ elif current == 2:
             log_verified_record(edited, final_confidence, "Verified")
             st.session_state.final_status = "Verified"
             st.session_state.final_data = {**edited, "Confidence": final_confidence}
-            go_to(3)
+            go_to(4)
             st.rerun()
     with b3:
         if st.button("⚠️ Send for Human Review", use_container_width=True):
             log_verified_record(edited, confidence, "Pending Review")
             st.session_state.final_status = "Pending Review"
             st.session_state.final_data = {**edited, "Confidence": confidence}
-            go_to(3)
+            go_to(4)
             st.rerun()
 
 # ========================================================================================
-# STEP 3 — RECORD LOG
+# STEP 4 — RECORD LOG
 # ========================================================================================
-elif current == 3:
-    st.markdown("### Step 4 — Record Log & Details")
+elif current == 4:
+    st.markdown("### Step 5 — Record Log & Details")
 
     if st.session_state.final_status == "Verified":
         st.success("Record verified and added to the digital land database!")
