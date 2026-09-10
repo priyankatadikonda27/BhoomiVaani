@@ -64,10 +64,7 @@ FIELD_PATTERNS = {
 STEPS = ["Upload", "Processing", "Verify", "Record Log"]
 
 LANGUAGE_OPTIONS = {
-    "English": "eng",
-    "Hindi (हिन्दी)": "hin",
-    "Telugu (తెలుగు)": "tel",
-    "Mixed / Auto (English + Hindi + Telugu)": "eng+hin+tel",
+    "English": "eng"
 }
 
 
