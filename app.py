@@ -21,6 +21,7 @@ vernacular-script labels too) is a natural next step beyond this prototype.
 
 import os
 import re
+import shutil
 import time
 from datetime import datetime
 
@@ -30,6 +31,40 @@ import pandas as pd
 from PIL import Image
 import cv2
 import pytesseract
+
+# --------------------------------------------------------------------------------------
+# TESSERACT BINARY DETECTION
+# --------------------------------------------------------------------------------------
+# pytesseract is only a wrapper around the `tesseract` command-line binary — pip
+# installing pytesseract does NOT install that binary. On Streamlit Community
+# Cloud (and most Linux hosts) it must come from an apt package, declared in a
+# packages.txt file next to requirements.txt:
+#
+#   packages.txt
+#   -------------
+#   tesseract-ocr
+#   tesseract-ocr-hin
+#   tesseract-ocr-tel
+#
+# If it's on PATH under a different name/location than pytesseract expects,
+# try to find it explicitly rather than relying on the default lookup.
+if shutil.which("tesseract"):
+    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract")
+else:
+    for _candidate in ("/usr/bin/tesseract", "/usr/local/bin/tesseract"):
+        if os.path.exists(_candidate):
+            pytesseract.pytesseract.tesseract_cmd = _candidate
+            break
+
+
+def tesseract_available() -> bool:
+    """Return True if the tesseract binary can actually be invoked."""
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
 
 # --------------------------------------------------------------------------------------
 # PAGE CONFIG
@@ -69,21 +104,8 @@ LANGUAGE_OPTIONS = {
 
 
 # --------------------------------------------------------------------------------------
-# CORE PIPELINE FUNCTIONS (run silently — not shown directly in the UI)
+# CORE PIPELINE FUNCTIONS
 # --------------------------------------------------------------------------------------
-def preprocess_and_ocr(pil_image: Image.Image, lang: str = "eng") -> tuple[str, Image.Image]:
-    """Preprocess image (grayscale, blur, Otsu threshold) then run Tesseract OCR."""
-    img = np.array(pil_image.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    try:
-        text = pytesseract.image_to_string(thresh, lang=lang)
-    except pytesseract.TesseractError:
-        # Language pack not installed on this machine — fall back to English.
-        text = pytesseract.image_to_string(thresh, lang="eng")
-    return text, Image.fromarray(thresh)
-
 
 def extract_fields(text: str) -> dict:
     """Rule-based extraction of the 7 required land-record fields from OCR text."""
@@ -192,6 +214,10 @@ with st.sidebar:
         """
     )
     st.markdown("---")
+    if tesseract_available():
+        st.caption("🟢 OCR engine: available")
+    else:
+        st.caption("🔴 OCR engine: not found — see Extract step")
     if st.button("🔁 Start Over", use_container_width=True):
         reset_flow()
         st.rerun()
@@ -253,7 +279,7 @@ if current == 0:
 
     if st.session_state.image is not None:
         st.success(f"Document loaded: **{st.session_state.source_label}**")
-        st.image(st.session_state.image, caption="Preview", width=450)
+        st.image(st.session_state.image, caption="Preview", use_container_width=False, width=500)
         if st.button("Next → Scan Document", type="primary"):
             go_to(1)
             st.rerun()
@@ -261,31 +287,60 @@ if current == 0:
         st.info("Upload a document or click a demo sample button above to continue.")
 
 # ========================================================================================
-# STEP 1 — SCAN (preprocessing only: grayscale, blur, Otsu threshold)
+# STEP 1 — SCAN (preprocessing: upscale, denoise, contrast-enhance, adaptive threshold)
 # ========================================================================================
 elif current == 1:
     st.markdown("### Step 2 — Scan: Original vs. Preprocessed")
     st.write(
-        "Before reading the text, the system cleans up the image — converting to grayscale "
-        "and applying thresholding so faint or uneven scans are easier to read."
+        "Before reading the text, the system cleans up the image so faint, shadowed, or "
+        "unevenly lit scans are easier to read accurately."
     )
 
     if not st.session_state.scanned:
         with st.spinner("Preprocessing image..."):
             img = np.array(st.session_state.image.convert("RGB"))
             gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            st.session_state.preprocessed_image = Image.fromarray(thresh)
+
+            # Upscale small/low-res photos — Tesseract does noticeably better
+            # above roughly 300 DPI-equivalent; phone photos of documents are
+            # often much smaller than that.
+            h, w = gray.shape
+            min_dim = min(h, w)
+            if min_dim < 1000:
+                scale = 1000 / min_dim
+                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+            # Denoise before contrast work so we don't amplify sensor/JPEG noise.
+            denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+            # CLAHE evens out lighting across the page (shadows, glare, uneven
+            # scans) far better than a single global contrast stretch.
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            contrast_enhanced = clahe.apply(denoised)
+
+            # Deliberately NOT forcing a hard black/white threshold here.
+            # Tesseract runs its own internal binarization on whatever image
+            # you hand it — layering a custom global/adaptive threshold on
+            # top of that usually just adds blotches and hurts both human
+            # readability and OCR accuracy. A clean, contrast-enhanced
+            # grayscale image is the sweet spot: legible to a person, and
+            # Tesseract still does its own (better-tuned) binarization on it.
+            st.session_state.preprocessed_image = Image.fromarray(contrast_enhanced)
             st.session_state.scanned = True
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Original**")
-        st.image(st.session_state.image, caption=st.session_state.source_label, width=380)
+        st.image(st.session_state.image, caption=st.session_state.source_label, use_container_width=True)
     with c2:
-        st.markdown("**Preprocessed (grayscale + threshold)**")
-        st.image(st.session_state.preprocessed_image, caption="Ready for OCR", width=380)
+        st.markdown("**Preprocessed (denoised + contrast-enhanced grayscale)**")
+        st.image(st.session_state.preprocessed_image, caption="Ready for OCR", use_container_width=True)
+
+    st.caption(
+        "We keep this as clean grayscale rather than forcing it to pure black & white — "
+        "Tesseract does its own binarization internally, and a hard threshold on top of "
+        "that tends to make the image blotchier for both humans and OCR."
+    )
 
     b1, b2 = st.columns(2)
     with b1:
@@ -304,17 +359,47 @@ elif current == 2:
     st.markdown("### Step 3 — Extract: OCR Text & Field Extraction")
     st.write("The system reads the preprocessed image with OCR, then pulls out the structured fields.")
 
-    if not st.session_state.extracted:
+    if not tesseract_available():
+        st.error(
+            "⚠️ **Tesseract OCR engine not found on this server.**\n\n"
+            "`pytesseract` is just a Python wrapper — it needs the actual `tesseract` "
+            "command-line program installed alongside it, and that doesn't come from "
+            "`pip install pytesseract`.\n\n"
+            "**If you're on Streamlit Community Cloud:** add a file named "
+            "`packages.txt` (no extension) to the root of your repo, next to "
+            "`requirements.txt`, containing:\n"
+            "```\ntesseract-ocr\ntesseract-ocr-hin\ntesseract-ocr-tel\n```\n"
+            "Then push/redeploy — Streamlit Cloud reads this file and apt-installs "
+            "those packages before your app boots.\n\n"
+            "**If you're running locally:** install it with your OS package manager, "
+            "e.g. `sudo apt install tesseract-ocr` (Debian/Ubuntu), "
+            "`brew install tesseract` (macOS), or the official Windows installer."
+        )
+        b1, _ = st.columns(2)
+        with b1:
+            if st.button("← Back"):
+                go_to(1)
+                st.rerun()
+    elif not st.session_state.extracted:
         progress = st.progress(0, text="Reading text...")
         lang_code = LANGUAGE_OPTIONS[st.session_state.ocr_lang_name]
         try:
-            ocr_text = pytesseract.image_to_string(
-                np.array(st.session_state.preprocessed_image), lang=lang_code
+            try:
+                ocr_text = pytesseract.image_to_string(
+                    np.array(st.session_state.preprocessed_image), lang=lang_code
+                )
+            except pytesseract.TesseractError:
+                # Requested language pack not installed — fall back to English.
+                ocr_text = pytesseract.image_to_string(
+                    np.array(st.session_state.preprocessed_image), lang="eng"
+                )
+        except pytesseract.TesseractNotFoundError:
+            st.error(
+                "⚠️ Tesseract OCR engine not found on this server. "
+                "See the message on this step for setup instructions, then reload."
             )
-        except pytesseract.TesseractError:
-            ocr_text = pytesseract.image_to_string(
-                np.array(st.session_state.preprocessed_image), lang="eng"
-            )
+            st.stop()
+
         progress.progress(60, text="Identifying land-record fields...")
         fields = extract_fields(ocr_text)
         time.sleep(0.3)
@@ -332,16 +417,17 @@ elif current == 2:
         st.markdown("#### 🗃️ Extracted Fields (JSON)")
         st.json(st.session_state.fields)
 
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("← Back"):
-            go_to(1)
-            st.rerun()
-    with b2:
-        if st.session_state.extracted:
-            if st.button("Next → Confidence & Verification", type="primary"):
-                go_to(3)
+    if tesseract_available():
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("← Back"):
+                go_to(1)
                 st.rerun()
+        with b2:
+            if st.session_state.extracted:
+                if st.button("Next → Confidence & Verification", type="primary"):
+                    go_to(3)
+                    st.rerun()
 
 # ========================================================================================
 # STEP 3 — CONFIDENCE + HUMAN VERIFICATION
