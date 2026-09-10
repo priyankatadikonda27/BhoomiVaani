@@ -12,20 +12,16 @@ the Upload step controls which OCR language model is used. Mixing all languages
 at once ("eng+hin+tel") on an English-only document was tested and found to
 reduce accuracy (Tesseract starts misreading Latin table lines as Telugu/Hindi
 glyphs), so the prototype asks the user (or an operator) to pick the dominant
-script instead of always guessing all three. Field *labels* now have Telugu
-alternatives too (e.g. "సర్వే నంబరు" as well as "Survey No"), so a native-Telugu
-document — labels and values both in Telugu script — is extracted correctly, not
-just documents with English labels and Telugu names/values. Hindi labels are not
-yet covered the same way; only English and Telugu label patterns are defined
-below, so a Hindi-labelled document still needs English labels to extract
-correctly (its OCR text will read fine, it's the field regexes that are
-English/Telugu-only for now).
+script instead of always guessing all three. Field *labels* in the extraction
+patterns are currently English ("Owner", "Survey No", ...); field *values* in
+Hindi/Telugu script are still captured correctly since the value-capture groups
+accept any characters. Fully label-language-agnostic extraction (matching
+vernacular-script labels too) is a natural next step beyond this prototype.
 """
 
 import os
 import re
 import time
-import unicodedata
 from datetime import datetime
 
 import streamlit as st
@@ -56,25 +52,13 @@ FIELD_PATTERNS = {
     # scanned ROR extracts where OCR doesn't preserve a colon between cells).
     # \b word boundaries after each label stop false matches inside longer words
     # (e.g. "Tehsil" inside "Tehsildar") now that the separator itself is optional.
-    #
-    # Each field now has a list of patterns tried in order — an English one and
-    # a Telugu one — so a document with Telugu field labels (not just Telugu
-    # names/values under English labels) still gets extracted. \w and \b are
-    # Unicode-aware in Python 3, so they work the same way against Telugu script.
-    "Owner":     [r"Owner\b\s*(?:Name)?\s*[:\-]?\s*(.+)",
-                  r"(?:యజమాని|పట్టాదారు(?:ని)?|రైతు)\s*(?:పేరు)?\s*[:\-]?\s*(.+)"],
-    "Survey No": [r"Survey\s*No\b\.?\s*[:\-]?\s*([\w\/\-]+)",
-                  r"సర్వే\s*నంబ(?:రు|ర్)\s*[:\-]?\s*([\w\/\-]+)"],
-    "Khata No":  [r"Khata\s*No\b\.?\s*[:\-]?\s*([\w\/\-]+)",
-                  r"ఖాతా\s*నంబ(?:రు|ర్)\s*[:\-]?\s*([\w\/\-]+)"],
-    "Area":      [r"Area\b\s*[:\-]?\s*([\d.]+\s*\w*)",
-                  r"విస్తీర్ణం\s*[:\-]?\s*([\d.]+\s*\w*)"],
-    "Village":   [r"Village\b\s*[:\-]?\s*(.+)",
-                  r"గ్రామం\s*[:\-]?\s*(.+)"],
-    "Tehsil":    [r"Tehsil\b\s*[:\-]?\s*(.+)",
-                  r"మండలం\s*[:\-]?\s*(.+)"],
-    "District":  [r"District\b\s*[:\-]?\s*(.+)",
-                  r"జిల్లా\s*[:\-]?\s*(.+)"],
+    "Owner":     r"Owner\b\s*(?:Name)?\s*[:\-]?\s*(.+)",
+    "Survey No": r"Survey\s*No\b\.?\s*[:\-]?\s*([\w\/\-]+)",
+    "Khata No":  r"Khata\s*No\b\.?\s*[:\-]?\s*([\w\/\-]+)",
+    "Area":      r"Area\b\s*[:\-]?\s*([\d.]+\s*\w*)",
+    "Village":   r"Village\b\s*[:\-]?\s*(.+)",
+    "Tehsil":    r"Tehsil\b\s*[:\-]?\s*(.+)",
+    "District":  r"District\b\s*[:\-]?\s*(.+)",
 }
 
 STEPS = ["Upload", "Processing", "Verify", "Record Log"]
@@ -90,217 +74,56 @@ LANGUAGE_OPTIONS = {
 # --------------------------------------------------------------------------------------
 # CORE PIPELINE FUNCTIONS (run silently — not shown directly in the UI)
 # --------------------------------------------------------------------------------------
-def _order_corners(pts: np.ndarray) -> np.ndarray:
-    """Order 4 arbitrary corner points as [top-left, top-right, bottom-right, bottom-left]."""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-def find_document_contour(image_bgr: np.ndarray):
-    """Look for a large 4-cornered contour (the page) in a photographed document.
-    Returns the 4 corner points, or None if nothing convincing is found — callers
-    should fall back to using the original image untouched."""
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 150)
-    edged = cv2.dilate(edged, None, iterations=1)
-    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-    image_area = image_bgr.shape[0] * image_bgr.shape[1]
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        # Require the candidate to be a quadrilateral covering a large share of the
-        # frame — otherwise it's more likely a stamp/table cell than the page edge.
-        if len(approx) == 4 and cv2.contourArea(approx) > 0.2 * image_area:
-            return approx.reshape(4, 2).astype("float32")
-    return None
-
-
-def warp_to_document(image_bgr: np.ndarray, corners: np.ndarray) -> np.ndarray:
-    """Perspective-warp a photographed document to a flat top-down view, like a
-    scanner app would, given its 4 detected corners."""
-    rect = _order_corners(corners)
-    (tl, tr, br, bl) = rect
-    width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-    height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-    if width < 10 or height < 10:
-        return image_bgr  # degenerate quad; not safe to warp
-    dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
-    matrix = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image_bgr, matrix, (width, height))
-
-
-def deskew(gray: np.ndarray) -> np.ndarray:
-    """Rotate the image so text lines run horizontally, based on the minimum-area
-    bounding box of the dark (text/ink) pixels. Skips rotation when there isn't
-    enough foreground to estimate an angle safely, or when it's already straight."""
-    inverted = cv2.bitwise_not(gray)
-    _, bw = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    coords = np.column_stack(np.where(bw > 0))
-    if coords.shape[0] < 20:
-        return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    angle = -(90 + angle) if angle < -45 else -angle
-    if abs(angle) < 0.5:
-        return gray
-    (h, w) = gray.shape[:2]
-    matrix = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    return cv2.warpAffine(gray, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-
 def preprocess_and_ocr(pil_image: Image.Image, lang: str = "eng") -> tuple[str, Image.Image]:
-    """Clean up the scan, then run Tesseract OCR.
-
-    The original version only did grayscale + blur + a single global Otsu
-    threshold, which is a reasonable start for a clean flatbed scan but breaks
-    down for the phone photos most users will actually upload: pages shot at an
-    angle, tilted text, low resolution, and uneven lighting/shadows all cause
-    Tesseract to misread or drop text. This pipeline handles those cases, with
-    every added stage wrapped so a failed/absent detection just falls back to
-    passing the image through unchanged rather than crashing the run.
-    """
-    img_rgb = np.array(pil_image.convert("RGB"))
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-    # 1. Flatten perspective if the page was photographed at an angle rather
-    #    than scanned flat.
-    try:
-        corners = find_document_contour(img_bgr)
-        if corners is not None:
-            img_bgr = warp_to_document(img_bgr, corners)
-    except cv2.error:
-        pass  # keep the original framing if edge detection misbehaves
-
-    # 2. Upscale small images — OCR accuracy drops sharply below roughly
-    #    150-200 DPI equivalent, and phone photos are often shrunk on upload.
-    h, w = img_bgr.shape[:2]
-    if w < 1500:
-        scale = 1500 / w
-        img_bgr = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-
-    # 3. Grayscale + denoise (phone camera sensor noise / JPEG artifacts).
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
-
-    # 4. Straighten tilted text.
-    try:
-        gray = deskew(gray)
-    except cv2.error:
-        pass
-
-    # 5. Normalize uneven lighting/shadows before binarizing, rather than
-    #    relying on a single global Otsu threshold across the whole page.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-
-    # 6. Binarize.
+    """Preprocess image (grayscale, blur, Otsu threshold) then run Tesseract OCR."""
+    img = np.array(pil_image.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 7. OCR. psm 6 ("assume a single uniform block of text") suits the dense
-    #    field-per-line/table layout of land records better than the default
-    #    fully-automatic segmentation (psm 3), which tends to fragment tables
-    #    into disconnected blocks and drop lines.
-    config = "--oem 3 --psm 6"
     try:
-        text = pytesseract.image_to_string(thresh, lang=lang, config=config)
+        text = pytesseract.image_to_string(thresh, lang=lang)
     except pytesseract.TesseractError:
         # Language pack not installed on this machine — fall back to English.
-        text = pytesseract.image_to_string(thresh, lang="eng", config=config)
+        text = pytesseract.image_to_string(thresh, lang="eng")
     return text, Image.fromarray(thresh)
 
 
 def extract_fields(text: str) -> dict:
-    """Rule-based extraction of the 7 required land-record fields from OCR text.
-    Each field has an English and a Telugu label pattern; the first one that
-    matches wins, so this works on English-labelled and Telugu-labelled
-    documents alike."""
+    """Rule-based extraction of the 7 required land-record fields from OCR text."""
     data = {}
-    for field, patterns in FIELD_PATTERNS.items():
-        value = ""
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                value = match.group(1).strip()
-                break
-        data[field] = value
+    for field, pattern in FIELD_PATTERNS.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        data[field] = match.group(1).strip() if match else ""
     return data
 
 
-# Format checks applied only where we have a reliable expected shape. Anything
-# not listed here is judged purely by _looks_like_garbage (below) since free-text
-# fields like Owner/Village/Tehsil/District don't have one fixed format.
-FIELD_FORMAT_CHECKS = {
-    "Survey No": (r"^[\w]+(?:[\/\-][\w]+)*$", "expected e.g. 123/4"),
-    "Khata No":  (r"^[\w]+(?:[\/\-][\w]+)*$", "expected e.g. 12 or 12/3"),
-    "Area":      (r"\d", "expected a number, e.g. 2.5 Acres"),
-}
-
-
-def _looks_like_garbage(value: str) -> bool:
-    """Heuristic OCR-noise detector: flags values that are too short to be real,
-    or where more than 40% of the (non-space) characters are punctuation/symbol
-    junk (stray @#~%$| characters, repeated punctuation, box-drawing artifacts)
-    — a common signature of a misread region rather than a genuine short value.
-
-    Deliberately checks Unicode category rather than str.isalnum(): Telugu (and
-    Hindi) spelling normally includes combining vowel signs and virama marks
-    (Unicode category "Mn"/"Mc") that isalnum() does NOT count as alphanumeric,
-    which would otherwise make correctly-read Telugu text look "garbled" just
-    for being in that script — the opposite of what this check is for.
-    """
-    stripped = value.strip()
-    if len(stripped) < 2:
-        return True
-    non_space = [ch for ch in stripped if not ch.isspace()]
-    if not non_space:
-        return True
-    # L* = letter, N* = number, M* = combining mark (accents/vowel signs/virama)
-    junk = sum(1 for ch in non_space if unicodedata.category(ch)[0] not in ("L", "N", "M"))
-    return (junk / len(non_space)) > 0.4
-
-
-def _field_problem(field: str, value: str) -> str:
-    """Returns a human-readable problem description for this field's value, or
-    "" if it looks fine. Used by both validate_record (to show the message) and
-    confidence_score (to decide whether the field counts toward confidence) —
-    so a field that drags down confidence always has a matching explanation."""
-    if not value.strip():
-        return f"{field} missing"
-    if _looks_like_garbage(value):
-        return f'{field} looks garbled, likely an OCR misread: "{value}"'
-    check = FIELD_FORMAT_CHECKS.get(field)
-    if check:
-        pattern, hint = check
-        if not re.search(pattern, value):
-            return f"{field} format looks unusual ({hint})"
-    return ""
-
-
 def validate_record(data: dict) -> list[str]:
-    """Rule-based validation engine — flags missing, garbled, or oddly-formatted
-    fields (see _field_problem)."""
-    return [problem for field in REQUIRED_FIELDS
-            if (problem := _field_problem(field, data.get(field, "")))]
+    """Rule-based validation engine — flags missing or suspicious fields."""
+    errors = []
+    if not data.get("Owner"):
+        errors.append("Owner name missing")
+    if not data.get("Survey No"):
+        errors.append("Survey number missing")
+    elif "/" not in data["Survey No"]:
+        errors.append("Survey number format looks unusual (expected e.g. 123/4)")
+    if not data.get("Khata No"):
+        errors.append("Khata number missing")
+    if not data.get("Area"):
+        errors.append("Area missing")
+    if not data.get("Village"):
+        errors.append("Village missing")
+    if not data.get("Tehsil"):
+        errors.append("Tehsil missing")
+    if not data.get("District"):
+        errors.append("District missing")
+    return errors
 
 
 def confidence_score(data: dict) -> float:
-    """Confidence = share of required fields that are both present AND pass the
-    same content-quality check validate_record uses — not just 'is this field
-    non-empty'. A field filled with garbled OCR output (symbols, a one-character
-    fragment, a Survey No with no digits) now counts against confidence instead
-    of padding it the way a merely-blank field would have before."""
-    if not data:
-        return 0.0
-    good = sum(1 for field in REQUIRED_FIELDS if not _field_problem(field, data.get(field, "")))
-    return round((good / len(REQUIRED_FIELDS)) * 100, 2)
+    """Simple explainable confidence metric = % of required fields successfully filled."""
+    total = len(data)
+    filled = sum(1 for v in data.values() if v.strip())
+    return round((filled / total) * 100, 2) if total else 0.0
 
 
 def confidence_bucket(score: float) -> tuple[str, str]:
@@ -331,7 +154,6 @@ defaults = {
     "source_label": None,
     "ocr_lang_name": "English",
     "processed": False,      # whether OCR + extraction has run for the current image
-    "preprocessed_image": None,  # cleaned-up (perspective-corrected, deskewed, thresholded) scan
     "fields": None,
     "errors": None,
     "confidence": None,
@@ -449,19 +271,16 @@ elif current == 1:
         progress.progress(35, text="Reading text...")
 
         lang_code = LANGUAGE_OPTIONS[st.session_state.ocr_lang_name]
-        ocr_text, cleaned_image = preprocess_and_ocr(st.session_state.image, lang=lang_code)
+        ocr_text, _ = preprocess_and_ocr(st.session_state.image, lang=lang_code)
 
         progress.progress(70, text="Identifying land-record fields...")
         fields = extract_fields(ocr_text)
         time.sleep(0.3)
         progress.progress(100, text="Done.")
 
-        # Raw extraction JSON is intentionally NOT displayed — only the structured
-        # result moves forward to the Verify step. The cleaned-up scan image IS kept
-        # (shown later behind an expander) so a reviewer can sanity-check what the
-        # OCR engine actually saw when a field comes back wrong or blank.
+        # OCR text and raw extraction JSON are intentionally NOT displayed —
+        # only the structured result moves forward to the Verify step.
         st.session_state.fields = fields
-        st.session_state.preprocessed_image = cleaned_image
         st.session_state.processed = True
         st.rerun()
     else:
@@ -503,12 +322,6 @@ elif current == 2:
                 st.write("•", e)
         else:
             st.write("All required fields present and well-formed.")
-
-    with st.expander("🔍 View cleaned-up scan (what the OCR engine actually read)"):
-        if st.session_state.preprocessed_image is not None:
-            st.image(st.session_state.preprocessed_image, caption="After perspective/deskew/threshold cleanup", width=450)
-        else:
-            st.caption("No cleaned-up scan available for this record.")
 
     st.markdown("#### 👤 Human Verification")
     st.caption(
